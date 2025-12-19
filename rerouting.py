@@ -8,6 +8,7 @@ import urllib.request
 import urllib.parse
 import os
 import requests
+from PIL import Image
 
 # env setup
 original_files_folder = "original files"
@@ -18,6 +19,13 @@ images_folder = "src/images"
 # utility functions 
 def get_root_path():
     return Path(__file__).parent
+
+def local_image_info(path):
+    p = Path(path)
+    size_bytes = p.stat().st_size
+    with Image.open(p) as im:
+        width, height = im.size
+    return size_bytes / (1024 ** 2), (width, height)
 
 # functions
 def delete_html_files(debug=0):
@@ -81,7 +89,29 @@ def get_img_from_all_routes(all_routes_file=all_routes_file):
     return img_routes
 
 
-def download_images(all_routes_file=all_routes_file, images_folder=images_folder, debug=0, count = -1):
+def pick_largest_image_urls(urls):
+    """Group image URLs by base filename (strip -{WxH} suffix) and pick the largest width.
+
+    Returns a list of chosen URLs (one per base image).
+    """
+    groups = {}
+    for u in urls:
+        try:
+            parsed = urllib.parse.urlparse(u)
+            name = Path(urllib.parse.unquote(parsed.path)).name
+        except Exception:
+            continue
+        # base filename without WP size suffix like -1024x768
+        base = re.sub(r'-\d+x\d+(?=\.)', '', name)
+        m = re.search(r'-(\d+)x(\d+)(?=\.)', name)
+        w = int(m.group(1)) if m else 0
+        cur = groups.get(base)
+        if cur is None or w > cur[0]:
+            groups[base] = (w, u)
+    return [info[1] for info in groups.values()]
+
+
+def download_images(all_routes_file=all_routes_file, images_folder=images_folder, debug=0, count = None):
     root = get_root_path()
     images_dir = root / images_folder
     images_dir.mkdir(parents=True, exist_ok=True)
@@ -94,38 +124,54 @@ def download_images(all_routes_file=all_routes_file, images_folder=images_folder
             print("all routes file not found:", root / all_routes_file)
         return [], [(None, "all_routes_file not found")]
     img_routes = [r for r in all_routes if r.lower().endswith(('.png', '.jpg', '.jpeg', '.gif', '.svg'))]
+    # reduce to only the largest variant per image base
+    img_routes = pick_largest_image_urls(img_routes)
     # print(len(img_routes), img_routes[0])
     
     counter = 0
     for img in img_routes:
-        if img[-1] == "/":
+        if img.endswith('/'):
             img = img[:-1]
-        base_name = img.split("/")[-1]
-        base_file_path = images_dir / base_name
+        try:
+            parsed = urllib.parse.urlparse(img)
+            base_name = Path(urllib.parse.unquote(parsed.path)).name
+        except Exception:
+            base_name = ''
+
+        if not base_name:
+            base_name = f"image_{counter}.jpg"
+
+        # sanitize filename for filesystem
+        safe_name = re.sub(r'[^A-Za-z0-9._-]', '_', base_name)
+        base_file_path = images_dir / safe_name
 
         if base_file_path.exists():
+            if debug:
+                print('exists:', base_file_path.name)
+            counter += 1
+            if count is not None and counter >= count:
+                break
             continue
-        else:
-            try:
-                headers = {"User-Agent": "Mozilla/5.0 (compatible)"}
-                resp = requests.get(img, headers=headers, stream=True, timeout=15, allow_redirects=True)
-                response = requests.get(img)
-                if response.status_code == 200:
-                                        
-                    with open(base_file_path, "wb") as out:
-                        for chunk in resp.iter_content(chunk_size=8192):
-                            if chunk:
-                                out.write(chunk)
-                    if debug:
-                        print("downloaded image:", base_name)
-                else:
-                    if debug:
-                        print("failed to download (status):", resp.status_code, img)
-            except Exception as e:
+
+        try:
+            headers = {"User-Agent": "Mozilla/5.0 (compatible)", "Accept": "image/*, */*"}
+            resp = requests.get(img, headers=headers, stream=True, timeout=15, allow_redirects=True)
+            if resp.status_code == 200:
+                with open(base_file_path, "wb") as out:
+                    for chunk in resp.iter_content(chunk_size=8192):
+                        if chunk:
+                            out.write(chunk)
                 if debug:
-                    print("error downloading image:", img, " error:", e)
+                    size_mb, _ = local_image_info(base_file_path)
+                    print("downloaded image:", base_file_path.name, f"{size_mb:.2f}", "MB")
+            else:
+                if debug:
+                    print("failed to download (status):", resp.status_code, img)
+        except Exception as e:
+            if debug:
+                print("error downloading image:", img, " error:", e)
         counter += 1
-        if counter != -1 and counter >= count:
+        if count is not None and counter >= count:
             break
 
 
